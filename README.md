@@ -56,7 +56,7 @@ Infraestructura base de una plataforma de datos en AWS, escrita en Terraform y p
 
 | Componente | Recursos | Dónde |
 |---|---|---|
-| Red | VPC, 2 subredes privadas en AZs distintas, 2 tablas de rutas, S3 Gateway Endpoint, security group por defecto sin reglas | `modules/network` |
+| Red | VPC, 2 subredes privadas en AZs distintas, 2 tablas de rutas, S3 Gateway Endpoint con policy restrictiva, security group por defecto sin reglas | `modules/network` |
 | Identidad | Rol de procesamiento + política inline, rol de auditoría + política inline | `modules/identity` |
 | Data lake | Bucket S3 con bloqueo público, versionado, cifrado SSE-S3 y expiración de `raw/` | `environments/dev/main.tf` |
 | Backend | Bucket S3 del state (SSE, versionado) y tabla DynamoDB de locking | `scripts/bootstrap-backend.sh` |
@@ -198,6 +198,7 @@ docker compose down                       # apaga LocalStack (y pierde todo su e
 
 ```bash
 # Endpoint de S3: tipo Gateway, estado available, asociado a las 2 tablas privadas
+# y con la policy restrictiva en PolicyDocument
 aws --endpoint-url=http://localhost:4566 ec2 describe-vpc-endpoints
 
 # Ningún Internet Gateway en la VPC (debe devolver una lista vacía)
@@ -264,6 +265,9 @@ Terraform lee todos los `.tf` de una carpeta como si fueran uno: separarlos es p
 | `vpc_cidr` | `string` | — | CIDR de la VPC |
 | `availability_zones` | `list(string)` | — | Una subred privada por zona; mínimo 2, sin repetir |
 | `subnet_newbits` | `number` | `8` | Bits extra para cada subred (`/16` + 8 = `/24`) |
+| `s3_endpoint_bucket_arns` | `list(string)` | — | Buckets a los que se puede llegar por el endpoint de S3 (mínimo 1) |
+| `s3_endpoint_allowed_principal_arns` | `list(string)` | — | Roles o usuarios IAM que pueden usar el endpoint (mínimo 1) |
+| `s3_endpoint_allowed_actions` | `list(string)` | `ListBucket`, `GetObject`, `PutObject` | Acciones de S3 permitidas por el endpoint, sin comodines |
 | `tags` | `map(string)` | `{}` | Tags adicionales |
 
 Outputs: `vpc_id`, `vpc_cidr_block`, `private_subnet_ids`, `private_route_table_ids`, `s3_vpc_endpoint_id`.
@@ -291,6 +295,13 @@ Outputs: `processing_role_arn`, `processing_role_name`, `audit_role_arn`, `audit
 - **Sin Internet Gateway, sin NAT, sin rutas a `0.0.0.0/0`.** Nada dentro de la VPC puede salir a internet ni ser alcanzado desde afuera.
 - **`map_public_ip_on_launch = false`** en todas las subredes.
 - **S3 por Gateway Endpoint:** agrega a cada tabla de rutas privada una ruta al *prefix list* de S3, así el tráfico a S3 viaja por la red interna de AWS. No tiene costo.
+- **Policy restrictiva en el endpoint:** sin policy, AWS deja el endpoint con acceso total a cualquier bucket de cualquier cuenta, lo que permitiría sacar datos de la VPC a un bucket ajeno. La policy limita el endpoint a:
+  - **Principal:** solo el rol de procesamiento (llega por output del módulo identity), no `"*"`.
+  - **Action:** solo `s3:ListBucket`, `s3:GetObject` y `s3:PutObject`, listadas una por una.
+  - **Resource:** solo el bucket del data lake y sus objetos. El ARN llega por output, nunca escrito a mano.
+  - El único `*` es el sufijo `<bucket>/*` del recurso: es la forma que tiene AWS de nombrar "los objetos de este bucket" y no se puede evitar sin listar cada objeto. No abre el acceso a otros buckets.
+  - Es un segundo filtro: un pedido a S3 desde la VPC tiene que cumplir la policy del endpoint **y** la política IAM del rol.
+  - En LocalStack, después del `apply` el `plan` sigue mostrando un cambio en esta policy: LocalStack guarda la policy sin el campo `Version` y Terraform quiere volver a agregarlo. En AWS real no pasa. Detalle en [PLAN_OUTPUT.md](PLAN_OUTPUT.md).
 - **Security group por defecto sin reglas:** por defecto AWS permite todo el tráfico entre recursos que lo usan; vaciarlo hace que cualquier recurso creado sin security group propio quede aislado.
 - **Subredes con `for_each` por zona:** agregar una zona no destruye ni recrea las existentes.
 

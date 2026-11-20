@@ -79,6 +79,32 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private[each.key].id
 }
 
+# Policy del endpoint: es un segundo filtro, además de las políticas IAM.
+# Todo pedido a S3 que salga de la VPC tiene que cumplir las dos. Sin esta
+# policy, AWS deja el endpoint con acceso total ("*") a cualquier bucket de
+# cualquier cuenta, lo que permitiría sacar datos a un bucket ajeno.
+data "aws_iam_policy_document" "s3_endpoint" {
+  statement {
+    sid     = "AllowProjectBucketsOnly"
+    effect  = "Allow"
+    actions = var.s3_endpoint_allowed_actions
+
+    # Solo los principals indicados (no "*").
+    principals {
+      type        = "AWS"
+      identifiers = var.s3_endpoint_allowed_principal_arns
+    }
+
+    # El bucket (para ListBucket) y sus objetos (para Get/Put). El "/*" final
+    # es el sufijo que AWS exige para nombrar "los objetos de este bucket":
+    # no hay otra forma de referirse a ellos sin listarlos uno por uno.
+    resources = concat(
+      var.s3_endpoint_bucket_arns,
+      [for arn in var.s3_endpoint_bucket_arns : "${arn}/*"],
+    )
+  }
+}
+
 # Gateway Endpoint de S3: agrega a cada tabla de rutas privada una ruta hacia
 # los rangos de IP de S3, sin necesidad de internet ni NAT. No tiene costo.
 resource "aws_vpc_endpoint" "s3" {
@@ -86,6 +112,7 @@ resource "aws_vpc_endpoint" "s3" {
   service_name      = "com.amazonaws.${data.aws_region.current.region}.s3"
   vpc_endpoint_type = "Gateway"
   route_table_ids   = [for rt in aws_route_table.private : rt.id]
+  policy            = data.aws_iam_policy_document.s3_endpoint.json
 
   tags = merge(var.tags, {
     Name = "${var.name_prefix}-s3-gateway-endpoint"

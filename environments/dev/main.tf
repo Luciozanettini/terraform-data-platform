@@ -29,6 +29,11 @@ module "network" {
   name_prefix        = local.name_prefix
   vpc_cidr           = var.vpc_cidr
   availability_zones = local.availability_zones
+
+  # Desde la VPC solo se llega al data lake, y solo con el rol de
+  # procesamiento (que es el que corre adentro: Lambda/Flink).
+  s3_endpoint_bucket_arns            = [aws_s3_bucket.data_lake.arn]
+  s3_endpoint_allowed_principal_arns = [module.identity.processing_role_arn]
 }
 
 # -----------------------------------------------------------------------------
