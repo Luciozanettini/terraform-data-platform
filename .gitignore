@@ -33,5 +33,12 @@ tfplan
 .terraformrc
 terraform.rc
 
+# Checkpoints de Flink montados por docker-compose (estado local, no código)
+checkpoints/
+
+# Variables de entorno locales (docker compose lee .env automáticamente;
+# el token de LocalStack nunca se versiona)
+.env
+
 # Nota: .terraform.lock.hcl SÍ se versiona, para que todo el equipo
 # use exactamente las mismas versiones de providers.
