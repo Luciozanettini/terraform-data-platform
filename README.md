@@ -9,6 +9,11 @@ Infraestructura base de una plataforma de datos en AWS, escrita en Terraform y p
 
 > Este proyecto nunca habla con AWS real: todos los comandos usan `tflocal` y `aws --endpoint-url=http://localhost:4566`.
 
+**Para revisar la entrega:**
+- [Puesta en marcha paso a paso](#puesta-en-marcha-paso-a-paso): cómo levantar todo.
+- [Cómo verificar cada criterio de la consigna](#cómo-verificar-cada-criterio-de-la-consigna): una tabla que lleva de cada criterio al archivo donde está y al comando que lo comprueba.
+- [PLAN_OUTPUT.md](PLAN_OUTPUT.md): la salida real de todos esos comandos.
+
 ---
 
 ## Índice
@@ -16,7 +21,7 @@ Infraestructura base de una plataforma de datos en AWS, escrita en Terraform y p
 1. [Qué se crea](#qué-se-crea)
 2. [Requisitos](#requisitos)
 3. [Puesta en marcha paso a paso](#puesta-en-marcha-paso-a-paso)
-4. [Cómo verificar lo desplegado](#cómo-verificar-lo-desplegado)
+4. [Cómo verificar cada criterio de la consigna](#cómo-verificar-cada-criterio-de-la-consigna)
 5. [Estructura del repositorio](#estructura-del-repositorio)
 6. [Módulos](#módulos)
 7. [Decisiones de diseño y seguridad](#decisiones-de-diseño-y-seguridad)
@@ -194,28 +199,208 @@ docker compose down                       # apaga LocalStack (y pierde todo su e
 
 ---
 
-## Cómo verificar lo desplegado
+## Cómo verificar cada criterio de la consigna
+
+### Resumen: criterio → dónde está → cómo se verifica
+
+| # | Criterio | Dónde está | Verificación |
+|---|---|---|---|
+| 1 | Estructura `modules/network`, `modules/identity`, `environments/dev`, `README.md` | [modules/](modules/), [environments/dev/](environments/dev/) | [C1](#c1-estructura-del-repositorio) |
+| 2 | `docker-compose.yml` en la raíz con el contenido provisto | [docker-compose.yml](docker-compose.yml) | [C2](#c2-docker-composeyml) |
+| 3 | Backend remoto: S3 con SSE + DynamoDB para locking, creados con AWS CLI | [scripts/bootstrap-backend.sh](scripts/bootstrap-backend.sh), [environments/dev/backend.tf](environments/dev/backend.tf) | [C3](#c3-backend-remoto-s3--dynamodb) |
+| 4 | `variables.tf` con tipo y descripción: entorno, región y CIDR de la VPC | [environments/dev/variables.tf](environments/dev/variables.tf) | [C4](#c4-variables-con-tipo-y-descripción) |
+| 5 | VPC con ≥ 2 subredes privadas en AZs distintas, sin IGW ni IPs públicas | [modules/network/main.tf](modules/network/main.tf) | [C5](#c5-red-privada) |
+| 6 | S3 Gateway Endpoint asociado a las tablas de rutas privadas | [modules/network/main.tf](modules/network/main.tf) | [C6](#c6-s3-gateway-endpoint) |
+| 7 | Rol de procesamiento: solo `s3:ListBucket`, `s3:GetObject` y `s3:PutObject` sobre un prefijo | [modules/identity/main.tf](modules/identity/main.tf) | [C7](#c7-roles-iam) |
+| 8 | Rol de plano de control de solo lectura para auditoría | [modules/identity/main.tf](modules/identity/main.tf) | [C7](#c7-roles-iam) |
+| 9 | Ningún permiso con `"*"` | [modules/identity/main.tf](modules/identity/main.tf) | [C8](#c8-ningún-permiso-con-) |
+| 10 | Outputs `vpc_id`, `private_subnet_ids` y ARNs de los roles | [environments/dev/outputs.tf](environments/dev/outputs.tf) | [C9](#c9-outputs) |
+| 11 | `tflocal validate`, `tflint`, `tflocal plan`, `tflocal apply` | — | [C10](#c10-validación-validate-tflint-plan-apply) |
+| 12 | `PLAN_OUTPUT.md` con plan, apply y `describe-vpc-endpoints` | [PLAN_OUTPUT.md](PLAN_OUTPUT.md) | [C11](#c11-plan_outputmd) |
+| 13 | Repo sin `.terraform/`, `*.tfstate*`, `checkpoints/` ni secretos | [.gitignore](.gitignore) | [C12](#c12-nada-sensible-en-el-repo) |
+| 14 | Módulo de red reutilizable para prod | [modules/network/](modules/network/) | [Reutilizar para prod](#reutilizar-para-prod) |
+
+### Antes de verificar
+
+Los comandos son de **bash** (en Windows, Git Bash). Se asume que ya se hicieron los pasos 1 a 5 de la [puesta en marcha](#puesta-en-marcha-paso-a-paso): LocalStack arriba, bootstrap corrido y `tflocal apply` hecho. Todos los comandos de AWS CLI apuntan a LocalStack con `--endpoint-url=http://localhost:4566`.
 
 ```bash
-# Endpoint de S3: tipo Gateway, estado available, asociado a las 2 tablas privadas
-# y con la policy restrictiva en PolicyDocument
-aws --endpoint-url=http://localhost:4566 ec2 describe-vpc-endpoints
-
-# Ningún Internet Gateway en la VPC (debe devolver una lista vacía)
-aws --endpoint-url=http://localhost:4566 ec2 describe-internet-gateways --filters Name=attachment.vpc-id,Values=$(tflocal output -raw vpc_id)
-
-# Subredes sin IP pública, en AZs distintas
-aws --endpoint-url=http://localhost:4566 ec2 describe-subnets --filters Name=vpc-id,Values=$(tflocal output -raw vpc_id) --query "Subnets[].[AvailabilityZone,CidrBlock,MapPublicIpOnLaunch]" --output table
-
-# Políticas de los roles
-aws --endpoint-url=http://localhost:4566 iam get-role-policy --role-name dataplat-dev-processing --policy-name dataplat-dev-processing-s3-prefix
-aws --endpoint-url=http://localhost:4566 iam get-role-policy --role-name dataplat-dev-audit-readonly --policy-name dataplat-dev-audit-readonly
-
-# Cifrado del bucket del state
-aws --endpoint-url=http://localhost:4566 s3api get-bucket-encryption --bucket dataplat-tfstate
+cd environments/dev
+export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1
+EP=http://localhost:4566
+VPC=$(tflocal output -raw vpc_id)
 ```
 
-(Los comandos con `tflocal output` se corren desde `environments/dev`.)
+Desde ahí, todos los comandos se corren en `environments/dev`.
+
+### C1. Estructura del repositorio
+
+```bash
+ls ../../modules/network ../../modules/identity .
+```
+
+**Esperado:**
+- `main.tf`, `variables.tf`, `outputs.tf` y `versions.tf` en cada módulo;
+- `backend.tf`, `main.tf` (llama a los dos módulos con `source = "../../modules/..."`), `provider.tf`, `variables.tf`, `outputs.tf` y `terraform.tfvars` en `environments/dev`.
+
+### C2. docker-compose.yml
+
+```bash
+docker compose -f ../../docker-compose.yml config --services
+```
+
+**Esperado:** `jobmanager`, `localstack`, `postgres` y `taskmanager`. El archivo es la copia exacta del provisto, sin cambios.
+
+### C3. Backend remoto (S3 + DynamoDB)
+
+El bucket y la tabla se crean con AWS CLI en [scripts/bootstrap-backend.sh](scripts/bootstrap-backend.sh), y [backend.tf](environments/dev/backend.tf) los usa.
+
+```bash
+aws --endpoint-url=$EP s3api get-bucket-encryption --bucket dataplat-tfstate
+aws --endpoint-url=$EP s3api get-bucket-versioning --bucket dataplat-tfstate
+aws --endpoint-url=$EP dynamodb describe-table --table-name dataplat-tf-locks --query "Table.KeySchema"
+aws --endpoint-url=$EP s3 ls s3://dataplat-tfstate/environments/dev/
+```
+
+**Esperado:**
+- `SSEAlgorithm: AES256`;
+- `Status: Enabled`;
+- clave `LockID` de tipo `HASH`;
+- el archivo `terraform.tfstate` dentro del bucket. El state no queda en la máquina local.
+
+### C4. Variables con tipo y descripción
+
+```bash
+grep -A3 -E 'variable "(environment|region|vpc_cidr)"' variables.tf
+```
+
+**Esperado:** cada una con `description` y `type = string`. Las tres tienen además un bloque `validation`: región con formato de AWS, entorno `dev`/`staging`/`prod` y CIDR IPv4 válido.
+
+Todas las variables del repo (las del entorno y las de los módulos) tienen tipo y descripción. Lo controla TFLint con las reglas `terraform_typed_variables` y `terraform_documented_variables` (ver [C10](#c10-validación-validate-tflint-plan-apply)).
+
+### C5. Red privada
+
+```bash
+# Subredes: 2, en AZs distintas, sin IP pública
+aws --endpoint-url=$EP ec2 describe-subnets --filters Name=vpc-id,Values=$VPC \
+  --query "Subnets[].[AvailabilityZone,CidrBlock,MapPublicIpOnLaunch]" --output table
+
+# Internet Gateways adjuntos a la VPC
+aws --endpoint-url=$EP ec2 describe-internet-gateways --filters Name=attachment.vpc-id,Values=$VPC
+
+# Rutas a internet (0.0.0.0/0) en las tablas de la VPC
+aws --endpoint-url=$EP ec2 describe-route-tables --filters Name=vpc-id,Values=$VPC \
+  --query "RouteTables[].Routes[?DestinationCidrBlock=='0.0.0.0/0'][]"
+```
+
+**Esperado:**
+- dos filas, `us-east-1a` y `us-east-1b`, con `False` en la IP pública;
+- `"InternetGateways": []`;
+- `[]`: ninguna ruta a internet.
+
+### C6. S3 Gateway Endpoint
+
+```bash
+aws --endpoint-url=$EP ec2 describe-vpc-endpoints \
+  --query "VpcEndpoints[].[VpcEndpointId,VpcEndpointType,ServiceName,State,RouteTableIds]"
+aws --endpoint-url=$EP ec2 describe-route-tables --filters Name=vpc-id,Values=$VPC \
+  --query "RouteTables[].[RouteTableId,Associations[].SubnetId,Routes[].GatewayId]"
+```
+
+**Esperado:**
+- El endpoint es `Gateway`, de `com.amazonaws.us-east-1.s3`, en estado `available`, con dos IDs de tabla de rutas.
+- Esas dos tablas son las que tienen asociada una subred privada cada una, y tienen una ruta con `GatewayId` igual al ID del endpoint (`vpce-...`).
+- Aparece una tercera tabla, sin subredes y solo con la ruta `local`: es la tabla principal que AWS crea con toda VPC.
+- La salida completa, con la policy restrictiva del endpoint, está en [PLAN_OUTPUT.md](PLAN_OUTPUT.md#6-aws-ec2-describe-vpc-endpoints).
+
+### C7. Roles IAM
+
+```bash
+# Rol de procesamiento: quién lo asume y qué puede hacer
+aws --endpoint-url=$EP iam get-role --role-name dataplat-dev-processing --query "Role.AssumeRolePolicyDocument"
+aws --endpoint-url=$EP iam get-role-policy --role-name dataplat-dev-processing \
+  --policy-name dataplat-dev-processing-s3-prefix --query "PolicyDocument"
+
+# Rol de auditoría: quién lo asume y qué puede leer
+aws --endpoint-url=$EP iam get-role --role-name dataplat-dev-audit-readonly --query "Role.AssumeRolePolicyDocument"
+aws --endpoint-url=$EP iam get-role-policy --role-name dataplat-dev-audit-readonly \
+  --policy-name dataplat-dev-audit-readonly --query "PolicyDocument"
+```
+
+**Esperado, rol de procesamiento:**
+- Trust solo para `lambda.amazonaws.com` y `kinesisanalytics.amazonaws.com`, con la condición `aws:SourceAccount`.
+- Permisos: `s3:ListBucket` sobre el bucket, limitado por la condición `s3:prefix = processed/`, y `s3:GetObject` / `s3:PutObject` sobre `<bucket>/processed/*`. Nada más: no tiene `DeleteObject` ni acceso a `raw/`.
+
+**Esperado, rol de auditoría:**
+- Trust para la cuenta, con la condición `aws:MultiFactorAuthPresent = true`.
+- Permisos: solo acciones `Get*` y `List*` de configuración, listadas una por una, sobre el bucket del data lake y los dos roles. No incluye `s3:GetObject`: audita la configuración, no lee los datos.
+
+### C8. Ningún permiso con `"*"`
+
+```bash
+# Desde la raíz del repo: líneas de código (sin comentarios) que contienen un *
+cd ../.. && grep -rn '\*' --include=main.tf modules environments | grep -v '#'; cd environments/dev
+
+# En las políticas ya desplegadas: no aparece ningún "*" suelto
+aws --endpoint-url=$EP iam get-role-policy --role-name dataplat-dev-processing \
+  --policy-name dataplat-dev-processing-s3-prefix | grep -c '"\*"'
+aws --endpoint-url=$EP iam get-role-policy --role-name dataplat-dev-audit-readonly \
+  --policy-name dataplat-dev-audit-readonly | grep -c '"\*"'
+```
+
+**Esperado:**
+- **Primer comando:** busca en los `main.tf`, que es donde se escriben las políticas (en los `variables.tf` el `*` aparece solo dentro de expresiones regulares de validación). Devuelve solo tres líneas, y en las tres el `*` es el **sufijo de un ARN o de un prefijo**:
+  - `"${var.processing_prefix}*"` (condición de ListBucket);
+  - `"${var.data_bucket_arn}/${var.processing_prefix}*"` (objetos de `processed/`);
+  - `"${arn}/*"` (objetos del bucket en la policy del endpoint).
+  
+  Ese sufijo **acota** el permiso a una carpeta o a un bucket. No hay `Action: "*"`, `s3:*`, `Resource: "*"` ni `Principal: "*"`.
+- **Los dos `grep -c`:** `0`.
+
+### C9. Outputs
+
+```bash
+tflocal output
+```
+
+**Esperado:** `vpc_id`, `private_subnet_ids` (lista de 2), `processing_role_arn` y `audit_role_arn`, más `s3_vpc_endpoint_id` y los datos del bucket.
+
+Terraform también muestra el aviso `Deprecated Parameter` sobre `dynamodb_table`. Es esperable: ver [State y secretos](#state-y-secretos).
+
+### C10. Validación (validate, tflint, plan, apply)
+
+```bash
+tflocal fmt -check -recursive ../..   # sin salida = formato correcto
+tflocal validate                      # Success! The configuration is valid.
+(cd ../.. && tflint --recursive)      # sin salida y exit code 0
+tflocal plan                          # después del apply: "0 to add, 1 to change, 0 to destroy" (ver abajo)
+```
+
+- El primer `plan` y el `apply` crean **18 recursos**.
+- Después del apply, LocalStack muestra un cambio en la policy del endpoint que no existe: guarda la policy sin el campo `Version`. En AWS real el plan da `No changes`. El detalle está en [PLAN_OUTPUT.md](PLAN_OUTPUT.md#8-state-remoto-y-segundo-plan).
+
+### C11. PLAN_OUTPUT.md
+
+[PLAN_OUTPUT.md](PLAN_OUTPUT.md) tiene las salidas reales, copiadas sin editar:
+- versiones;
+- `validate`;
+- `tflint`;
+- `plan`: 18 recursos a crear;
+- `apply`: 18 creados, con los outputs;
+- `describe-vpc-endpoints`, con el endpoint S3 y su policy;
+- la verificación de IGW, subredes y rutas;
+- el state en S3;
+- el segundo plan.
+
+### C12. Nada sensible en el repo
+
+```bash
+cd ../.. && git ls-files | grep -E '\.terraform/|\.tfstate|checkpoints/'; echo "coincidencias: $?"
+```
+
+**Esperado:** ninguna línea y `coincidencias: 1`: `grep` no encontró nada.
+- El token de LocalStack solo existe como variable de entorno.
+- `.terraform.lock.hcl` **sí** se versiona a propósito, para que todos usen la misma versión del provider.
 
 ---
 
@@ -251,7 +436,25 @@ aws --endpoint-url=http://localhost:4566 s3api get-bucket-encryption --bucket da
 └── README.md
 ```
 
-Terraform lee todos los `.tf` de una carpeta como si fueran uno: separarlos es para las personas. Cada archivo responde una pregunta (¿qué versiones? ¿qué se configura? ¿qué se crea? ¿qué se expone?).
+### ¿Por qué separar en varios archivos y no un único `main.tf`?
+
+Terraform lee todos los `.tf` de una carpeta como si fueran un solo archivo, así que separarlos no cambia el resultado: es para las personas que leen y revisan el código. Cada archivo responde una pregunta:
+
+| Archivo | Pregunta que responde | Quién lo toca |
+|---|---|---|
+| `versions.tf` / `provider.tf` | ¿Qué versiones de Terraform y del provider? ¿Contra qué región y con qué tags? | Casi nunca; un cambio acá afecta todo |
+| `backend.tf` | ¿Dónde se guarda el state y cómo se bloquea? | Una vez por entorno |
+| `variables.tf` | ¿Qué se puede configurar desde afuera? Es el "contrato" del módulo o entorno | Quien agrega una opción nueva |
+| `main.tf` | ¿Qué recursos se crean y cómo se conectan? | El día a día |
+| `outputs.tf` | ¿Qué datos se exponen para que otros los consuman? | Quien necesita conectar piezas |
+| `terraform.tfvars` | ¿Con qué valores concretos se despliega este entorno? | Cambia entre dev y prod; el código no |
+
+Las ventajas concretas:
+- **Code reviews más claras:** un PR que solo toca `terraform.tfvars` cambia valores, no lógica.
+- **Menos conflictos en git** cuando varias personas trabajan a la vez.
+- **Módulos fáciles de usar:** para saber cómo usar `modules/network` alcanza con leer su `variables.tf` y su `outputs.tf`, sin entrar al `main.tf`.
+
+Con el mismo criterio, el código está separado en **módulos por dominio** (red e identidad) y en **entornos que los componen** (`environments/dev`), en vez de un módulo gigante que haga todo.
 
 ---
 
@@ -320,6 +523,23 @@ Outputs: `processing_role_arn`, `processing_role_name`, `audit_role_arn`, `audit
 - **Nada sensible en git:** `.gitignore` excluye `.terraform/`, `*.tfstate*`, `checkpoints/`, `.env` y `*.secret.tfvars`.
 - **Token de LocalStack** solo como variable de entorno.
 - **Sin IDs ni ARNs hardcodeados:** el bucket se pasa al módulo de identidad por output; el account ID, la partición, la región y las zonas salen de *data sources*.
+
+### Protección contra borrados y blast radius
+
+- **`prevent_destroy` no se usa en dev, a propósito.** `lifecycle { prevent_destroy = true }` hace que Terraform se niegue a borrar un recurso: es la protección recomendada para el storage crítico de producción. Hay dos motivos para no usarlo acá:
+  - En dev, LocalStack se recrea seguido y `tflocal destroy` tiene que poder limpiar todo.
+  - `prevent_destroy` no acepta variables: no se puede escribir `prevent_destroy = var.environment == "prod"`. Si estuviera en el código compartido, también bloquearía dev.
+- **Cómo se protege prod:**
+  - `force_destroy = var.environment != "prod"`: en prod, Terraform no puede borrar el bucket del data lake si tiene objetos.
+  - El versionado del bucket permite recuperar objetos sobrescritos o borrados.
+  - En el root module de prod (`environments/prod/main.tf`) se agregaría `prevent_destroy = true` al bucket del data lake. Ese archivo es solo de prod y no afecta a dev.
+- **Un state por entorno:** cada entorno tiene su propia `key` en el backend (`environments/dev/terraform.tfstate`, `environments/prod/terraform.tfstate`).
+  - Un `apply` o `destroy` en `environments/dev` no puede tocar prod.
+  - Por eso los entornos son carpetas separadas y no un `for_each` sobre `["dev", "prod"]`: con un `for_each`, dev y prod compartirían el mismo state.
+- **Próximo paso, states por dominio:** hoy cada entorno tiene un solo state con red, IAM y data lake, que son 18 recursos y se planifican rápido. Cuando se sumen Kinesis, Flink y Redshift conviene separarlos en proyectos independientes (red, identidad, ingesta, procesamiento), cada uno con su `key`.
+  - Los states chicos son más rápidos de planificar.
+  - Reducen el **blast radius**: un error o un lock trabado en el state de Flink no impide cambiar la red.
+  - Los módulos ya están separados por dominio, así que la división es mover las llamadas a carpetas distintas y conectarlas con `terraform_remote_state` o con *data sources*.
 
 ---
 
